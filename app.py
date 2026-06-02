@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, EmailStr
 import uvicorn
-
+import os
 from db import get_conn, generate_salt, hash_password, verify_password
 
 CCTV_FEED_BASE = "https://name-meat-yet-stage.trycloudflare.com/stream?key=praise-the-fool"
@@ -1829,6 +1829,4 @@ def admin_page():
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    import uvicorn
-    import os
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
