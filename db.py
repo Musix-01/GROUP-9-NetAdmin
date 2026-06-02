@@ -1,4 +1,3 @@
-"""Database helpers — PostgreSQL (Supabase) via DATABASE_URL in .env."""
 import hashlib
 import binascii
 import os
@@ -16,9 +15,9 @@ ITERATIONS = 100_000
 SALT_BYTES = 16
 HASH_BYTES = 32
 
-DEFAULT_ADMIN_EMAIL = "admin@yosan.com"
-DEFAULT_ADMIN_PASSWORD = "Admin@1234"
-DEFAULT_ADMIN_NAME = "Yosan Admin"
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+ADMIN_NAME = os.getenv("ADMIN_NAME", "Yosan Admin").strip() or "Yosan Admin"
 
 
 def get_conn():
@@ -83,6 +82,19 @@ def init_db():
     )
     cursor.execute(
         """
+        CREATE TABLE IF NOT EXISTS login_bans (
+            id SERIAL PRIMARY KEY,
+            email TEXT,
+            ip TEXT,
+            reason TEXT,
+            banned_by TEXT,
+            banned_at TIMESTAMPTZ DEFAULT NOW(),
+            active BOOLEAN NOT NULL DEFAULT TRUE
+        )
+        """
+    )
+    cursor.execute(
+        """
         CREATE TABLE IF NOT EXISTS motion_events (
             id SERIAL PRIMARY KEY,
             start_time TEXT NOT NULL,
@@ -101,6 +113,16 @@ def init_db():
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS revoked_tokens (
+            id SERIAL PRIMARY KEY,
+            jti TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+    cursor.execute("DELETE FROM revoked_tokens WHERE expires_at <= NOW()")
     conn.commit()
     _ensure_default_admin(cursor)
     conn.commit()
@@ -108,14 +130,16 @@ def init_db():
 
 
 def _ensure_default_admin(cursor):
-    cursor.execute("SELECT id FROM admins WHERE email = %s", (DEFAULT_ADMIN_EMAIL.lower(),))
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
+    cursor.execute("SELECT id FROM admins WHERE email = %s", (ADMIN_EMAIL,))
     if cursor.fetchone():
         return
     salt = generate_salt()
-    pw_hash = hash_password(DEFAULT_ADMIN_PASSWORD, salt)
+    pw_hash = hash_password(ADMIN_PASSWORD, salt)
     cursor.execute(
         "INSERT INTO admins (name, email, password_hash, salt) VALUES (%s, %s, %s, %s)",
-        (DEFAULT_ADMIN_NAME, DEFAULT_ADMIN_EMAIL.lower(), pw_hash, salt),
+        (ADMIN_NAME, ADMIN_EMAIL, pw_hash, salt),
     )
 
 
