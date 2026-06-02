@@ -1,10 +1,17 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from starlette.responses import Response as StarletteResponse
 from pydantic import BaseModel, EmailStr
+from datetime import datetime, timedelta, timezone
+import base64
+import os
+import jwt
+import uuid
 import uvicorn
-
-from db import get_conn, generate_salt, hash_password, verify_password
+from dotenv import load_dotenv
+from db import get_conn, generate_salt, hash_password, verify_password, init_db
+load_dotenv(override=True)
 
 CCTV_FEED_BASE = "https://name-meat-yet-stage.trycloudflare.com/stream?key=praise-the-fool"
 CCTV_STREAM_PATH = "/stream?key=[stream-key]"
@@ -14,15 +21,185 @@ def cctv_remote_url() -> str:
     return CCTV_FEED_BASE.rstrip("/") + CCTV_STREAM_PATH
 
 app = FastAPI()
+init_db()
+
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = "HS256"
+ACCESS_EXPIRE_MINUTES = 15
+REFRESH_EXPIRE_DAYS = 7
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+COOKIE_SECURE = APP_ENV == "production"
+COOKIE_SAMESITE = "strict" if APP_ENV == "production" else "lax"
+COOKIE_PATH = "/"
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000"
+    ).split(",")
+    if o.strip()
+]
+
+
+def _cookie_options(request: Request) -> tuple[bool, str]:
+    secure = APP_ENV == "production" and request.url.scheme == "https"
+    samesite = "strict" if secure else "lax"
+    return secure, samesite
+
+LOGIN_WINDOW_SECONDS = 15 * 60
+MAX_FAILED_LOGINS = 10
+FAILED_LOGIN_TRACKER: dict[str, list[float]] = {}
+
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set. Add a strong JWT_SECRET to .env.")
+
+
+def _create_token(email: str, role: str, name: str, token_type: str) -> str:
+    now = datetime.now(timezone.utc)
+    exp = (
+        now + timedelta(minutes=ACCESS_EXPIRE_MINUTES)
+        if token_type == "access"
+        else now + timedelta(days=REFRESH_EXPIRE_DAYS)
+    )
+    payload = {
+        "sub": email.lower(),
+        "role": role,
+        "name": name,
+        "type": token_type,
+        "jti": str(uuid.uuid4()),
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _is_revoked(jti: str) -> bool:
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM revoked_tokens WHERE jti = %s", (jti,))
+    row = cursor.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def _revoke_jti(jti: str, expires_at: int):
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO revoked_tokens (jti, expires_at)
+        VALUES (%s, to_timestamp(%s))
+        ON CONFLICT (jti) DO NOTHING
+        """,
+        (jti, expires_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _decode_token(token: str, expected_type: str | None = None) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    if expected_type and payload.get("type") != expected_type:
+        raise HTTPException(status_code=401, detail="Invalid token type.")
+    jti = payload.get("jti", "")
+    if jti and _is_revoked(jti):
+        raise HTTPException(status_code=401, detail="Token has been revoked.")
+    return payload
+
+
+def _get_auth_payload(request: Request, require_admin: bool = False) -> dict:
+    auth = request.headers.get("Authorization", "")
+    token = auth.split(" ", 1)[1].strip() if auth.startswith("Bearer ") else ""
+    if not token:
+        token = request.cookies.get("yosan_access", "")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing authorization token.")
+    payload = _decode_token(token, expected_type="access")
+    if require_admin and payload.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required.")
+    return payload
+
+
+def _prune_failed_logins(key: str):
+    now = datetime.now(timezone.utc).timestamp()
+    entries = FAILED_LOGIN_TRACKER.get(key, [])
+    FAILED_LOGIN_TRACKER[key] = [ts for ts in entries if now - ts <= LOGIN_WINDOW_SECONDS]
+
+
+def _record_failed_login(key: str):
+    _prune_failed_logins(key)
+    FAILED_LOGIN_TRACKER.setdefault(key, []).append(datetime.now(timezone.utc).timestamp())
+
+
+def _clear_failed_logins(key: str):
+    FAILED_LOGIN_TRACKER.pop(key, None)
+
+
+def _is_banned(email: str, ip: str) -> bool:
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT 1 FROM login_bans WHERE active = TRUE AND (email = %s OR ip = %s) LIMIT 1",
+        (email.lower() if email else None, ip),
+    )
+    blocked = cursor.fetchone() is not None
+    conn.close()
+    return blocked
 
 # CORS (development only)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    nonce = base64.urlsafe_b64encode(os.urandom(16)).decode().rstrip("=")
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cache-Control"] = "no-store"
+    if APP_ENV == "production":
+        response.headers[
+            "Strict-Transport-Security"
+        ] = "max-age=63072000; includeSubDomains; preload"
+    # Allow inline event handlers in non-production (development) so existing
+    # `onclick` attributes work. In production we keep a strict policy.
+    script_src_extra = " 'unsafe-inline'" if APP_ENV != "production" else ""
+    csp = (
+      "default-src 'self'; "
+      "img-src 'self' data: blob: https:; "
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+      f"font-src 'self' https://fonts.gstatic.com; "
+      f"script-src 'self' 'nonce-{nonce}'{script_src_extra}; "
+      "connect-src 'self' https:; "
+      "frame-ancestors 'none'"
+    )
+    # Only rewrite HTML bodies — skip StreamingResponse (CCTV) and non-HTML
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("text/html"):
+        body_bytes = b""
+        async for chunk in response.body_iterator:
+            body_bytes += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
+        body = body_bytes.decode("utf-8").replace("<script>", f'<script nonce="{nonce}">')
+        headers = dict(response.headers)
+        headers.pop("content-length", None)
+        response = StarletteResponse(
+            content=body,
+            status_code=response.status_code,
+            headers=headers,
+            media_type=response.media_type,
+        )
+    response.headers["Content-Security-Policy"] = csp
+    return response
 
 # ---------- request models ----------
 class SignupRequest(BaseModel):
@@ -38,6 +215,11 @@ class LoginRequest(BaseModel):
 class ActivityLogRequest(BaseModel):
     email: EmailStr
     action: str
+
+class BanRequest(BaseModel):
+    email: EmailStr | None = None
+    ip: str | None = None
+    reason: str | None = None
 
 # ---------- Auth endpoints ----------
 @app.post("/api/signup")
@@ -64,6 +246,26 @@ def signup(data: SignupRequest):
 def login(data: LoginRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
     email = data.email.lower()
+    limiter_key = f"{email}:{ip}"
+    _prune_failed_logins(limiter_key)
+    if len(FAILED_LOGIN_TRACKER.get(limiter_key, [])) >= MAX_FAILED_LOGINS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed login attempts. Please wait and try again.",
+        )
+    if _is_banned(email, ip):
+        conn = get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO login_logs (email, name, status, ip) VALUES (%s, %s, 'BLOCKED', %s)",
+            (email, None, ip),
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(
+            status_code=403,
+            detail="Login blocked. Contact the administrator.",
+        )
     conn = get_conn()
     cursor = conn.cursor()
 
@@ -75,13 +277,38 @@ def login(data: LoginRequest, request: Request):
         data.password, admin_row["salt"], admin_row["password_hash"]
     ):
         name = admin_row["name"]
+        access_token = _create_token(email, "admin", name, "access")
+        refresh_token = _create_token(email, "admin", name, "refresh")
         cursor.execute(
             "INSERT INTO login_logs (email, name, status, ip) VALUES (%s, %s, 'SUCCESS', %s)",
             (email, name, ip),
         )
         conn.commit()
         conn.close()
-        return {"status": "ok", "name": name, "email": email, "role": "admin"}
+        _clear_failed_logins(limiter_key)
+        secure, samesite = _cookie_options(request)
+        response = JSONResponse(
+            {"status": "ok", "name": name, "email": email, "role": "admin", "token": access_token}
+        )
+        response.set_cookie(
+            key="yosan_access",
+            value=access_token,
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+            path=COOKIE_PATH,
+            max_age=ACCESS_EXPIRE_MINUTES * 60,
+        )
+        response.set_cookie(
+            key="yosan_refresh",
+            value=refresh_token,
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+            path=COOKIE_PATH,
+            max_age=REFRESH_EXPIRE_DAYS * 24 * 60 * 60,
+        )
+        return response
 
     cursor.execute(
         "SELECT name, password_hash, salt FROM users WHERE email = %s", (email,)
@@ -89,14 +316,40 @@ def login(data: LoginRequest, request: Request):
     row = cursor.fetchone()
     if row and verify_password(data.password, row["salt"], row["password_hash"]):
         name = row["name"]
+        access_token = _create_token(email, "user", name, "access")
+        refresh_token = _create_token(email, "user", name, "refresh")
         cursor.execute(
             "INSERT INTO login_logs (email, name, status, ip) VALUES (%s, %s, 'SUCCESS', %s)",
             (email, name, ip),
         )
         conn.commit()
         conn.close()
-        return {"status": "ok", "name": name, "email": email, "role": "user"}
+        _clear_failed_logins(limiter_key)
+        secure, samesite = _cookie_options(request)
+        response = JSONResponse(
+            {"status": "ok", "name": name, "email": email, "role": "user", "token": access_token}
+        )
+        response.set_cookie(
+            key="yosan_access",
+            value=access_token,
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+            path=COOKIE_PATH,
+            max_age=ACCESS_EXPIRE_MINUTES * 60,
+        )
+        response.set_cookie(
+            key="yosan_refresh",
+            value=refresh_token,
+            httponly=True,
+            secure=secure,
+            samesite=samesite,
+            path=COOKIE_PATH,
+            max_age=REFRESH_EXPIRE_DAYS * 24 * 60 * 60,
+        )
+        return response
 
+    _record_failed_login(limiter_key)
     cursor.execute(
         "INSERT INTO login_logs (email, name, status, ip) VALUES (%s, %s, 'FAILED', %s)",
         (email, None, ip),
@@ -105,9 +358,74 @@ def login(data: LoginRequest, request: Request):
     conn.close()
     raise HTTPException(status_code=401, detail="Invalid email or password.")
 
+
+@app.post("/api/auth/refresh")
+def refresh_session(request: Request):
+    refresh_token = request.cookies.get("yosan_refresh", "")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Missing refresh token.")
+    payload = _decode_token(refresh_token, expected_type="refresh")
+    old_jti = payload.get("jti", "")
+    old_exp = int(payload.get("exp", 0))
+    if old_jti:
+        _revoke_jti(old_jti, old_exp)
+    email = payload.get("sub", "")
+    role = payload.get("role", "")
+    name = payload.get("name", "")
+    access_token = _create_token(email, role, name, "access")
+    new_refresh = _create_token(email, role, name, "refresh")
+    secure, samesite = _cookie_options(request)
+    response = JSONResponse(
+        {"status": "ok", "token": access_token, "role": role, "name": name, "email": email}
+    )
+    response.set_cookie(
+        key="yosan_access",
+        value=access_token,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        path=COOKIE_PATH,
+        max_age=ACCESS_EXPIRE_MINUTES * 60,
+    )
+    response.set_cookie(
+        key="yosan_refresh",
+        value=new_refresh,
+        httponly=True,
+        secure=secure,
+        samesite=samesite,
+        path=COOKIE_PATH,
+        max_age=REFRESH_EXPIRE_DAYS * 24 * 60 * 60,
+    )
+    return response
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    access = request.cookies.get("yosan_access", "")
+    refresh = request.cookies.get("yosan_refresh", "")
+    for token in [access, refresh]:
+        if token:
+            try:
+                payload = _decode_token(token)
+                jti = payload.get("jti", "")
+                exp = int(payload.get("exp", 0))
+                if jti:
+                    _revoke_jti(jti, exp)
+            except HTTPException:
+                pass
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie("yosan_access", path=COOKIE_PATH)
+    response.delete_cookie("yosan_refresh", path=COOKIE_PATH)
+    return response
+
 # ---------- Activity logging ----------
 @app.post("/api/user/log-activity")
-def log_user_activity(data: ActivityLogRequest):
+def log_user_activity(data: ActivityLogRequest, request: Request):
+    payload = _get_auth_payload(request)
+    if payload.get("role") != "user":
+        raise HTTPException(status_code=403, detail="User access required.")
+    if payload.get("sub", "").lower() != data.email.lower():
+        raise HTTPException(status_code=403, detail="Cannot log activity for another user.")
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM users WHERE email = %s", (data.email.lower(),))
@@ -121,7 +439,8 @@ def log_user_activity(data: ActivityLogRequest):
 
 
 @app.get("/api/admin/users")
-def admin_users():
+def admin_users(request: Request):
+    _get_auth_payload(request, require_admin=True)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name, email FROM users ORDER BY id DESC")
@@ -140,7 +459,8 @@ def admin_users():
 
 
 @app.delete("/api/admin/users/{user_id}")
-def admin_delete_user(user_id: int):
+def admin_delete_user(user_id: int, request: Request):
+    _get_auth_payload(request, require_admin=True)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute("SELECT email FROM users WHERE id = %s", (user_id,))
@@ -154,7 +474,8 @@ def admin_delete_user(user_id: int):
 
 
 @app.get("/api/admin/logs")
-def admin_logs(limit: int = 200):
+def admin_logs(request: Request, limit: int = 200):
+    _get_auth_payload(request, require_admin=True)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -166,6 +487,51 @@ def admin_logs(limit: int = 200):
     return {"logs": logs}
 
 
+@app.get("/api/admin/bans")
+def admin_bans(request: Request):
+    _get_auth_payload(request, require_admin=True)
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, email, ip, reason, banned_by, banned_at FROM login_bans WHERE active = TRUE ORDER BY banned_at DESC"
+    )
+    bans = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"bans": bans}
+
+
+@app.post("/api/admin/bans")
+def admin_create_ban(data: BanRequest, request: Request):
+    payload = _get_auth_payload(request, require_admin=True)
+    if not data.email and not data.ip:
+        raise HTTPException(status_code=400, detail="Email or IP is required.")
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO login_bans (email, ip, reason, banned_by) VALUES (%s, %s, %s, %s)",
+        (
+            data.email.lower() if data.email else None,
+            data.ip,
+            data.reason,
+            payload.get("sub", "admin"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
+@app.delete("/api/admin/bans/{ban_id}")
+def admin_remove_ban(ban_id: int, request: Request):
+    _get_auth_payload(request, require_admin=True)
+    conn = get_conn()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE login_bans SET active = FALSE WHERE id = %s", (ban_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+
 class MotionLogRequest(BaseModel):
     start_time: str
     end_time: str | None = None
@@ -173,7 +539,8 @@ class MotionLogRequest(BaseModel):
 
 
 @app.post("/api/motion/log")
-def log_motion(data: MotionLogRequest):
+def log_motion(data: MotionLogRequest, request: Request):
+    _get_auth_payload(request)
     conn = get_conn()
     cursor = conn.cursor()
     cursor.execute(
@@ -186,7 +553,8 @@ def log_motion(data: MotionLogRequest):
 
 
 @app.get("/api/motion/events")
-def motion_events(limit: int = 200):
+def motion_events(request: Request, limit: int = 200):
+    _get_auth_payload(request)
     conn = get_conn()
     cursor = conn.cursor()
     lim = max(1, min(limit, 500))
@@ -792,8 +1160,16 @@ async function doLogin() {{
   out.className = 'msg';
   const payload = {{ email: document.getElementById('loginEmail').value, password: document.getElementById('loginPass').value }};
   try {{
-    const res = await fetch('/api/login', {{ method:'POST', headers:{{'Content-Type':'application/json'}}, body:JSON.stringify(payload) }});
-    const data = await res.json();
+    const res = await fetch('/api/login', {{
+      method:'POST',
+      credentials:'same-origin',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify(payload)
+    }});
+    const data = await res.json().catch(async () => {{
+      const text = await res.text();
+      throw {{ detail: text || 'Invalid response from server.' }};
+    }});
     if (!res.ok) throw data;
     localStorage.setItem('yosan_user', data.name);
     localStorage.setItem('yosan_role', data.role);
@@ -808,8 +1184,9 @@ async function doLogin() {{
       window.location.href = data.role === 'admin' ? '/admin' : '/dashboard';
     }}, 700);
   }} catch(e) {{
+    console.error('Login failed', e);
     out.className = 'msg error';
-    out.textContent = e.detail || 'Something went wrong.';
+    out.textContent = (e && e.detail) || (typeof e === 'string' ? e : 'Something went wrong.');
   }}
 }}
 </script>
@@ -1090,7 +1467,7 @@ DASHBOARD_HTML = f"""
     </button>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-logout">
-      <a href="/" onclick="disconnectCctv(); localStorage.removeItem('yosan_user'); localStorage.removeItem('yosan_email'); localStorage.removeItem('yosan_role');">
+      <a href="/" onclick="logoutAndGoHome(); return false;">
         <span>🚪</span> Sign Out
       </a>
     </div>
@@ -1213,7 +1590,7 @@ DASHBOARD_HTML = f"""
         <div class="account-info-row"><span class="account-info-label">Role</span><span class="account-info-val">Standard User</span></div>
         <div class="account-info-row"><span class="account-info-label">Session</span><span class="account-info-val" id="acct-session">Active</span></div>
         <div style="margin-top:1.5rem;">
-          <a href="/" onclick="disconnectCctv(); localStorage.removeItem('yosan_user'); localStorage.removeItem('yosan_email'); localStorage.removeItem('yosan_role');" class="cam-btn cam-btn-red" style="display:inline-flex;align-items:center;gap:8px;text-decoration:none;padding:10px 20px;border-radius:8px;">🚪 Sign Out</a>
+          <a href="/" onclick="logoutAndGoHome(); return false;" class="cam-btn cam-btn-red" style="display:inline-flex;align-items:center;gap:8px;text-decoration:none;padding:10px 20px;border-radius:8px;">🚪 Sign Out</a>
         </div>
       </div>
     </div>
@@ -1222,12 +1599,61 @@ DASHBOARD_HTML = f"""
 </div><!-- .shell -->
 
 <script>
+  let refreshInFlight = null;
+
+  async function tryRefreshToken() {{
+    if (refreshInFlight) return refreshInFlight;
+    refreshInFlight = fetch('/api/auth/refresh', {{
+      method: 'POST',
+      credentials: 'same-origin'
+    }}).then(r => r.ok).catch(() => false).finally(() => {{ refreshInFlight = null; }});
+    return refreshInFlight;
+  }}
+
+  async function clearSessionAndRedirect() {{
+    try {{
+      await fetch('/api/logout', {{ method: 'POST', credentials: 'same-origin' }});
+    }} catch (e) {{}}
+    localStorage.removeItem('yosan_user');
+    localStorage.removeItem('yosan_email');
+    localStorage.removeItem('yosan_role');
+    window.location.href = '/login';
+  }}
+
+  async function logoutAndGoHome() {{
+    disconnectCctv();
+    try {{
+      await fetch('/api/logout', {{ method: 'POST', credentials: 'same-origin' }});
+    }} catch (e) {{}}
+    localStorage.removeItem('yosan_user');
+    localStorage.removeItem('yosan_email');
+    localStorage.removeItem('yosan_role');
+    window.location.href = '/';
+  }}
+
+  async function authFetch(url, options = {{}}) {{
+    const opts = {{ ...options }};
+    opts.credentials = 'same-origin';
+    const res = await fetch(url, opts);
+    if (res.status === 401 || res.status === 403) {{
+      const refreshed = await tryRefreshToken();
+      if (refreshed) {{
+        const retryOpts = {{ ...opts, credentials: 'same-origin' }};
+        const retry = await fetch(url, retryOpts);
+        if (retry.status !== 401 && retry.status !== 403) return retry;
+      }}
+      await clearSessionAndRedirect();
+      throw new Error('Unauthorized or expired session');
+    }}
+    return res;
+  }}
+
   // ── Activity tracking (regular users only) ──
   async function trackActivity(action) {{
     const email = localStorage.getItem('yosan_email');
     if (!email || localStorage.getItem('yosan_role') === 'admin') return;
     try {{
-      await fetch('/api/user/log-activity', {{
+      await authFetch('/api/user/log-activity', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ email, action }})
@@ -1444,7 +1870,7 @@ DASHBOARD_HTML = f"""
   async function logMotionEvent() {{
     const now = new Date().toISOString().replace('T',' ').substring(0,19);
     try {{
-      await fetch('/api/motion/log', {{
+      await authFetch('/api/motion/log', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
         body: JSON.stringify({{ start_time: now, end_time: now, duration_seconds: 0 }})
@@ -1460,7 +1886,7 @@ DASHBOARD_HTML = f"""
   async function loadMotionEvents() {{
     document.getElementById('motion-log-container').innerHTML = '<div class="no-logs">Loading…</div>';
     try {{
-      const res  = await fetch('/api/motion/events?limit=200');
+      const res  = await authFetch('/api/motion/events?limit=200');
       const data = await res.json();
       const events = data.events || [];
       document.getElementById('stat-events-today').textContent = data.today_count ?? '—';
@@ -1495,7 +1921,7 @@ DASHBOARD_HTML = f"""
   trackActivity('Opened dashboard');
   (async () => {{
     try {{
-      const res = await fetch('/api/motion/events?limit=1');
+      const res = await authFetch('/api/motion/events?limit=1');
       const data = await res.json();
       const today = data.today_count ?? '0';
       const total = data.total ?? '0';
@@ -1581,7 +2007,7 @@ ADMIN_HTML = f"""
     </div>
     <div class="sidebar-spacer"></div>
     <div class="sidebar-logout">
-      <a href="/login" onclick="localStorage.clear()"><span>🚪</span> Sign Out</a>
+      <a href="/login" onclick="clearAdminSession(); return false;"><span>🚪</span> Sign Out</a>
     </div>
   </aside>
 
@@ -1624,6 +2050,13 @@ ADMIN_HTML = f"""
         </div>
         <div id="logs-container"><div class="no-data">Loading…</div></div>
       </div>
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Active Bans</span>
+          <button class="btn btn-amber" onclick="loadBans()">↻ Refresh</button>
+        </div>
+        <div id="bans-container"><div class="no-data">Loading…</div></div>
+      </div>
     </div>
 
     <!-- Motion Events -->
@@ -1644,6 +2077,43 @@ ADMIN_HTML = f"""
 </div>
 
 <script>
+  let adminRefreshInFlight = null;
+
+  async function tryAdminRefresh() {{
+    if (adminRefreshInFlight) return adminRefreshInFlight;
+    adminRefreshInFlight = fetch('/api/auth/refresh', {{
+      method: 'POST',
+      credentials: 'same-origin'
+    }}).then(r => r.ok).catch(() => false).finally(() => {{ adminRefreshInFlight = null; }});
+    return adminRefreshInFlight;
+  }}
+
+  async function clearAdminSession() {{
+    try {{
+      await fetch('/api/logout', {{ method: 'POST', credentials: 'same-origin' }});
+    }} catch (e) {{}}
+    localStorage.removeItem('yosan_user');
+    localStorage.removeItem('yosan_role');
+    localStorage.removeItem('yosan_email');
+    window.location.href = '/login';
+  }}
+
+  async function adminFetch(url, options = {{}}) {{
+    const opts = {{ ...options }};
+    opts.credentials = 'same-origin';
+    const res = await fetch(url, opts);
+    if (res.status === 401 || res.status === 403) {{
+      const refreshed = await tryAdminRefresh();
+      if (refreshed) {{
+        const retry = await fetch(url, {{ ...opts, credentials: 'same-origin' }});
+        if (retry.status !== 401 && retry.status !== 403) return retry;
+      }}
+      await clearAdminSession();
+      throw new Error('Unauthorized');
+    }}
+    return res;
+  }}
+
   // Guard: redirect if not admin
   if (localStorage.getItem('yosan_role') !== 'admin') {{
     window.location.href = '/login';
@@ -1657,7 +2127,7 @@ ADMIN_HTML = f"""
     const titles = {{ users: 'User Management', logs: 'Login Logs', motion: 'Motion Events' }};
     document.getElementById('page-title').textContent = titles[name];
     if (name === 'users')  loadUsers();
-    if (name === 'logs')   loadLogs();
+    if (name === 'logs')   {{ loadLogs(); loadBans(); }}
     if (name === 'motion') loadMotion();
   }}
 
@@ -1677,7 +2147,7 @@ ADMIN_HTML = f"""
   // ── Users ──
   async function loadUsers() {{
     try {{
-      const data = await fetch('/api/admin/users').then(r => r.json());
+      const data = await adminFetch('/api/admin/users').then(r => r.json());
       document.getElementById('stat-users').textContent = data.users.length;
       if (!data.users.length) {{
         document.getElementById('users-container').innerHTML = '<div class="no-data">No registered users yet.</div>';
@@ -1705,16 +2175,58 @@ ADMIN_HTML = f"""
     if (!confirm('Delete this user? This cannot be undone.')) return;
     btn.disabled = true; btn.textContent = '…';
     try {{
-      await fetch('/api/admin/users/' + id, {{ method: 'DELETE' }});
+      await adminFetch('/api/admin/users/' + id, {{ method: 'DELETE' }});
       loadUsers();
     }} catch(e) {{ btn.disabled = false; btn.textContent = '🗑 Delete'; }}
   }}
 
   // ── Login Logs ──
   let allLogs = [], currentFilter = 'all';
+  let activeBans = {{ emails: new Set(), ips: new Set() }};
+
+  async function loadBans() {{
+    try {{
+      const data = await adminFetch('/api/admin/bans').then(r => r.json());
+      activeBans.emails = new Set((data.bans || []).filter(b => b.email).map(b => b.email.toLowerCase()));
+      activeBans.ips = new Set((data.bans || []).filter(b => b.ip).map(b => b.ip));
+      renderBans(data.bans || []);
+    }} catch(e) {{
+      document.getElementById('bans-container').innerHTML = '<div class="no-data">⚠️ Failed to load bans.</div>';
+    }}
+  }}
+
+  async function banLoginTarget(type, value, btn) {{
+    if (!confirm(`Ban ${{type.toUpperCase()}} ${{value}}?`)) return;
+    btn.disabled = true;
+    try {{
+      await adminFetch('/api/admin/bans', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(type === 'email' ? {{ email: value }} : {{ ip: value }})
+      }});
+      await loadBans();
+      await loadLogs();
+    }} catch(e) {{
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }}
+  }}
+
+  async function removeBan(id, btn) {{
+    btn.disabled = true;
+    try {{
+      await adminFetch('/api/admin/bans/' + id, {{ method: 'DELETE' }});
+      await loadBans();
+      await loadLogs();
+    }} catch(e) {{
+      btn.disabled = false;
+      btn.textContent = 'Retry';
+    }}
+  }}
+
   async function loadLogs() {{
     try {{
-      const data = await fetch('/api/admin/logs?limit=200').then(r => r.json());
+      const data = await adminFetch('/api/admin/logs?limit=200').then(r => r.json());
       allLogs = data.logs;
       document.getElementById('stat-total').textContent   = allLogs.length;
       document.getElementById('stat-success').textContent = allLogs.filter(l => l.status==='SUCCESS').length;
@@ -1735,7 +2247,16 @@ ADMIN_HTML = f"""
   function renderLogs() {{
     const filtered = currentFilter === 'all' ? allLogs : allLogs.filter(l => l.status === currentFilter);
     if (!filtered.length) {{ document.getElementById('logs-container').innerHTML = '<div class="no-data">No entries.</div>'; return; }}
-    const rows = filtered.map(l => `
+    const rows = filtered.map(l => {{
+      const emailBanned = l.email && activeBans.emails.has(l.email.toLowerCase());
+      const ipBanned = l.ip && activeBans.ips.has(l.ip);
+      const actionButton = l.status === 'FAILED' ? (
+        `<div style="display:flex;gap:6px;flex-wrap:wrap;">
+           ${{l.email ? `<button class="btn btn-danger" ${{emailBanned ? 'disabled' : ''}} onclick="banLoginTarget('email', '${{esc(l.email)}}', this)">${{emailBanned ? 'Email banned' : 'Ban email'}}</button>` : ''}}
+           ${{l.ip ? `<button class="btn btn-danger" ${{ipBanned ? 'disabled' : ''}} onclick="banLoginTarget('ip', '${{esc(l.ip)}}', this)">${{ipBanned ? 'IP banned' : 'Ban ip'}}</button>` : ''}}
+         </div>`
+      ) : '';
+      return `
       <tr>
         <td style="color:#64748B;font-size:0.78rem;">${{l.id}}</td>
         <td style="font-family:monospace;font-size:0.82rem;">${{esc(l.email)}}</td>
@@ -1743,16 +2264,42 @@ ADMIN_HTML = f"""
         <td><span class="badge badge-${{l.status.toLowerCase()}}">${{esc(l.status)}}</span></td>
         <td style="color:#64748B;font-size:0.78rem;">${{esc(l.ip)}}</td>
         <td style="color:#64748B;font-size:0.78rem;">${{esc(l.logged_at)}}</td>
-      </tr>`).join('');
+        <td>${{actionButton}}</td>
+      </tr>`;
+    }}).join('');
     document.getElementById('logs-container').innerHTML = `
-      <table><thead><tr><th>#</th><th>Email</th><th>Name</th><th>Status</th><th>IP</th><th>Time</th></tr></thead>
+      <table><thead><tr><th>#</th><th>Email</th><th>Name</th><th>Status</th><th>IP</th><th>Time</th><th>Action</th></tr></thead>
       <tbody>${{rows}}</tbody></table>`;
   }}
+
+  function renderBans(bans) {{
+    if (!bans.length) {{ document.getElementById('bans-container').innerHTML = '<div class="no-data">No active bans.</div>'; return; }}
+    const rows = bans.map(b => `
+      <tr>
+        <td style="color:#64748B;font-size:0.78rem;">${{b.id}}</td>
+        <td style="font-family:monospace;font-size:0.82rem;">${{esc(b.email || '—')}}</td>
+        <td>${{esc(b.ip || '—')}}</td>
+        <td>${{esc(b.reason || 'Manual ban')}}</td>
+        <td>${{esc(b.banned_by || 'admin')}}</td>
+        <td style="color:#64748B;font-size:0.78rem;">${{esc(b.banned_at)}}</td>
+        <td><button class="btn btn-danger" onclick="removeBan(${{b.id}}, this)">Remove</button></td>
+      </tr>`).join('');
+    document.getElementById('bans-container').innerHTML = `
+      <table><thead><tr><th>#</th><th>Email</th><th>IP</th><th>Reason</th><th>Banned By</th><th>When</th><th>Action</th></tr></thead>
+      <tbody>${{rows}}</tbody></table>`;
+  }}
+
+  setInterval(() => {{
+    if (document.getElementById('view-logs').classList.contains('active')) {{
+      loadLogs();
+      loadBans();
+    }}
+  }}, 5000);
 
   // ── Motion Events ──
   async function loadMotion() {{
     try {{
-      const data = await fetch('/api/motion/events?limit=200').then(r => r.json());
+      const data = await adminFetch('/api/motion/events?limit=200').then(r => r.json());
       document.getElementById('stat-motion-today').textContent = data.today_count ?? '0';
       document.getElementById('stat-motion-total').textContent = data.total ?? '0';
       if (!data.events.length) {{ document.getElementById('motion-container').innerHTML = '<div class="no-data">No motion events yet.</div>'; return; }}
