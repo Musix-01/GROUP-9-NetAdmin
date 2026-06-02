@@ -9,12 +9,12 @@ from db import get_conn, generate_salt, hash_password, verify_password
 CCTV_FEED_BASE = "https://name-meat-yet-stage.trycloudflare.com/stream?key=praise-the-fool"
 CCTV_STREAM_PATH = "/stream?key=[stream-key]"
 
-
 def cctv_remote_url() -> str:
     return CCTV_FEED_BASE.rstrip("/") + CCTV_STREAM_PATH
 
 app = FastAPI()
 
+# CORS (development only)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -160,6 +160,28 @@ def admin_logs(limit: int = 200):
         "SELECT id, email, name, status, ip, logged_at FROM login_logs ORDER BY id DESC LIMIT %s",
         (max(1, min(limit, 500)),),
     )
+    logs = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"logs": logs}
+
+
+
+
+@app.get("/api/admin/live-logins")
+def live_logins(limit: int = 20):
+    conn = get_conn()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT email, name, status, ip, logged_at
+        FROM login_logs
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (max(1, min(limit, 100)),),
+    )
+
     logs = [dict(r) for r in cursor.fetchall()]
     conn.close()
     return {"logs": logs}
@@ -781,7 +803,7 @@ LOGIN_HTML = f"""
     <input id="loginEmail" type="email" placeholder="you@email.com" />
     <label for="loginPass">Password</label>
     <input id="loginPass" type="password" placeholder="Your password" />
-    <button class="btn-primary" onclick="doLogin()">Sign In</button>
+    <button id="loginButton" class="btn-primary">Sign In</button>
     <div id="out" class="msg"></div>
     <div class="footer">No account yet? <a href="/signup">Create one</a> &nbsp;·&nbsp; <a href="/">Home</a></div>
   </div>
@@ -811,6 +833,13 @@ async function doLogin() {{
     out.textContent = e.detail || 'Something went wrong.';
   }}
 }}
+
+document.addEventListener('DOMContentLoaded', function() {{
+  const loginButton = document.getElementById('loginButton');
+  if (loginButton) {{
+    loginButton.addEventListener('click', doLogin);
+  }}
+}});
 </script>
 </body>
 </html>
@@ -1800,4 +1829,4 @@ def admin_page():
 
 # ---------- Run ----------
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=False)
