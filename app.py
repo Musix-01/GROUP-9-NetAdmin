@@ -6,8 +6,8 @@ import uvicorn
 
 from db import get_conn, generate_salt, hash_password, verify_password
 
-CCTV_FEED_BASE = "https://star-faced-retirement-inherited.trycloudflare.com"
-CCTV_STREAM_PATH = "/stream"  # MJPEG at {base}/stream (root URL returns 404)
+CCTV_FEED_BASE = "https://name-meat-yet-stage.trycloudflare.com/stream?key=praise-the-fool"
+CCTV_STREAM_PATH = "/stream?key=[stream-key]"
 
 
 def cctv_remote_url() -> str:
