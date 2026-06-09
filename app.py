@@ -702,7 +702,7 @@ SIGNUP_HTML = """
       <div class="blob blob-1"></div>
       <div class="blob blob-2"></div>
       <div class="right-title">Welcome to<br>Yosan</div>
-      <p class="right-sub">Monitor your CCTV cameras with intelligent motion detection.</p>
+      <p class="right-sub">Monitor your CCTV cameras.</p>
       <div class="features">
         <div class="feature-item"><div class="feature-icon">🌐</div><span class="feature-text">Live CCTV Monitoring</span></div>
         <div class="feature-item"><div class="feature-icon">🎯</div><span class="feature-text">Motion Detection</span></div>
@@ -1640,7 +1640,6 @@ ADMIN_HTML = f"""
     <div style="padding:0.8rem 0.4rem 0;">
       <button class="nav-item active" id="nav-users" onclick="showView('users')"><span class="nav-icon">👥</span> Users</button>
       <button class="nav-item" id="nav-logs" onclick="showView('logs')"><span class="nav-icon">🛡️</span> Login Logs</button>
-      <button class="nav-item" id="nav-motion" onclick="showView('motion')"><span class="nav-icon">🎯</span> Motion Events</button>
       <button class="nav-item" id="nav-camera" onclick="showView('camera')"><span class="nav-icon">📷</span> Camera</button>
     </div>
     <div class="sidebar-spacer"></div>
@@ -1690,28 +1689,11 @@ ADMIN_HTML = f"""
       </div>
     </div>
 
-    <!-- Motion Events -->
-    <div class="view" id="view-motion">
-      <div class="stats-row">
-        <div class="stat-card"><div class="stat-icon">🎯</div><div class="stat-label">Today</div><div class="stat-value" id="stat-motion-today">—</div></div>
-        <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-label">Total</div><div class="stat-value" id="stat-motion-total">—</div></div>
-      </div>
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">Motion Detection Log</span>
-          <button class="btn btn-amber" onclick="loadMotion()">↻ Refresh</button>
-        </div>
-        <div id="motion-container"><div class="no-data">Loading…</div></div>
-      </div>
-    </div>
-
     <!-- Camera -->
     <div class="view" id="view-camera">
       <div class="stats-row">
-        <div class="stat-card"><div class="stat-icon">🔴</div><div class="stat-label">Camera Status</div><div class="stat-value" id="adm-stat-cam" style="font-size:1.1rem;margin-top:8px;">Offline</div></div>
-        <div class="stat-card"><div class="stat-icon">🎯</div><div class="stat-label">Motion</div><div class="stat-value" id="adm-stat-motion" style="font-size:1.1rem;margin-top:8px;">—</div></div>
-        <div class="stat-card"><div class="stat-icon">📋</div><div class="stat-label">Events Today</div><div class="stat-value" id="adm-stat-today">—</div></div>
-        <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-label">Total Events</div><div class="stat-value" id="adm-stat-total">—</div></div>
+        <div class="stat-card"><div class="stat-icon">🔴</div><div class="stat-label">CCTV Status</div><div class="stat-value" id="adm-stat-cam" style="font-size:1.1rem;margin-top:8px;">Offline</div></div>
+        <div class="stat-card"><div class="stat-icon">🎥</div><div class="stat-label">CCTV Screen</div><div class="stat-value" id="adm-stat-motion" style="font-size:1.1rem;margin-top:8px;">—</div></div>
       </div>
 
       <div class="panel cam-wrap">
