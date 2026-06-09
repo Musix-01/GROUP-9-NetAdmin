@@ -1724,7 +1724,6 @@ ADMIN_HTML = f"""
         <div class="cam-controls" style="margin-top:1rem;">
           <button class="cam-btn cam-btn-green" onclick="admConnectCctv()">▶ Connect CCTV</button>
           <button class="cam-btn cam-btn-red"   onclick="admDisconnectCctv()">■ Disconnect CCTV</button>
-          <button class="btn btn-amber"          onclick="admLoadMotionEvents()">↻ Refresh Events</button>
         </div>
         <div id="adm-cctv-feedback" style="margin-top:0.8rem; font-size:0.9rem; color:rgba(255,255,255,0.45);"></div>
         <p id="adm-cam-status"></p>
