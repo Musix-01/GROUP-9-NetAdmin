@@ -1729,12 +1729,7 @@ ADMIN_HTML = f"""
         <p id="adm-cam-status"></p>
       </div>
 
-      <div class="panel" style="margin-top:1.2rem;">
-        <div class="panel-header">
-          <span class="panel-title">Recent Motion Events</span>
-        </div>
-        <div id="adm-motion-log"><div class="no-data">Loading…</div></div>
-      </div>
+
     </div>
   </div>
 </div>
