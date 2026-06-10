@@ -6,7 +6,7 @@ import uvicorn
 import os
 from db import get_conn, generate_salt, hash_password, verify_password
 
-CCTV_FEED_BASE = "https://merchants-centres-trace-pressure.trycloudflare.com/stream?key=praise-the-fool"
+CCTV_FEED_BASE = "https://name-meat-yet-stage.trycloudflare.com/stream?key=praise-the-fool"
 CCTV_STREAM_PATH = "/stream?key=[stream-key]"
 
 def cctv_remote_url() -> str:
@@ -31,8 +31,33 @@ class SignupRequest(BaseModel):
     repass: str
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
+
+# ---------- Suspicious input detection ----------
+import re
+
+SQLI_PATTERNS = [
+    r"(\bor\b|\band\b)\s+['\"]?\s*\d+\s*=\s*\d+",          # OR 1=1 / AND 1=1
+    r"(\bor\b|\band\b)\s+['\"][^'\"]*['\"]\s*=\s*['\"][^'\"]*['\"]",  # OR '1'='1'
+    r"--",                                                   # SQL comment
+    r"#",                                                    # MySQL comment
+    r"/\*",                                                  # block comment
+    r";\s*(drop|delete|update|insert|select)\b",             # stacked queries
+    r"\bunion\b\s+\bselect\b",                               # UNION SELECT
+    r"\bxp_cmdshell\b",
+    r"['\"]\s*(or|and)\s*['\"]?\s*['\"]",                    # ' or ' / " and "
+]
+SQLI_REGEX = re.compile("|".join(SQLI_PATTERNS), re.IGNORECASE)
+
+def looks_like_sql_injection(*values: str) -> bool:
+    for v in values:
+        if not v:
+            continue
+        if SQLI_REGEX.search(v):
+            return True
+    return False
+
 
 class ActivityLogRequest(BaseModel):
     email: EmailStr
@@ -62,9 +87,19 @@ def signup(data: SignupRequest):
 @app.post("/api/login")
 def login(data: LoginRequest, request: Request):
     ip = request.client.host if request.client else "unknown"
-    email = data.email.lower()
+    email_raw = data.email
+    email = email_raw.strip().lower()
     conn = get_conn()
     cursor = conn.cursor()
+
+    if looks_like_sql_injection(email_raw, data.password):
+        cursor.execute(
+            "INSERT INTO login_logs (email, name, status, ip) VALUES (%s, %s, 'SUSPICIOUS', %s)",
+            (email_raw, None, ip),
+        )
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     cursor.execute(
         "SELECT name, password_hash, salt FROM admins WHERE email = %s", (email,)
@@ -702,7 +737,7 @@ SIGNUP_HTML = """
       <div class="blob blob-1"></div>
       <div class="blob blob-2"></div>
       <div class="right-title">Welcome to<br>Yosan</div>
-      <p class="right-sub">Monitor your CCTV cameras.</p>
+      <p class="right-sub">Monitor your CCTV cameras with intelligent motion detection.</p>
       <div class="features">
         <div class="feature-item"><div class="feature-icon">🌐</div><span class="feature-text">Live CCTV Monitoring</span></div>
         <div class="feature-item"><div class="feature-icon">🎯</div><span class="feature-text">Motion Detection</span></div>
@@ -759,7 +794,20 @@ async function doSignup() {
     if (!res.ok) throw data;
     msg.className = 'msg success'; msg.textContent = 'Account created! Redirecting…';
     setTimeout(() => { window.location.href = '/login'; }, 900);
-  } catch(e) { msg.className = 'msg error'; msg.textContent = e.detail || 'Something went wrong.'; }
+  } catch(e) { msg.className = 'msg error'; msg.textContent = formatErrorDetail(e); }
+}
+
+function formatErrorDetail(e) {
+  const detail = e && e.detail;
+  if (!detail) return 'Something went wrong.';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    const first = detail[0];
+    if (first && first.loc && first.loc.includes('email')) return 'Please enter a valid email address.';
+    if (first && first.msg) return first.msg;
+    return 'Something went wrong.';
+  }
+  return 'Something went wrong.';
 }
 </script>
 </body>
@@ -830,8 +878,21 @@ async function doLogin() {{
     }}, 700);
   }} catch(e) {{
     out.className = 'msg error';
-    out.textContent = e.detail || 'Something went wrong.';
+    out.textContent = formatErrorDetail(e);
   }}
+}}
+
+function formatErrorDetail(e) {{
+  const detail = e && e.detail;
+  if (!detail) return 'Something went wrong.';
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {{
+    const first = detail[0];
+    if (first && first.loc && first.loc.includes('email')) return 'Please enter a valid email address.';
+    if (first && first.msg) return first.msg;
+    return 'Something went wrong.';
+  }}
+  return 'Something went wrong.';
 }}
 
 document.addEventListener('DOMContentLoaded', function() {{
@@ -1584,6 +1645,7 @@ ADMIN_HTML = f"""
     .badge {{ display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }}
     .badge-success {{ background: rgba(16,185,129,0.15); color: #6EE7B7; }}
     .badge-failed  {{ background: rgba(239,68,68,0.15);  color: #FCA5A5; }}
+    .badge-suspicious {{ background: rgba(239,68,68,0.15); color: #FCA5A5; }}
     .btn {{ padding: 7px 16px; border: none; border-radius: 8px; font-family: 'DM Sans',sans-serif; font-size: 0.82rem; font-weight: 700; cursor: pointer; transition: all 0.15s; }}
     .btn-amber {{ background: rgba(245,158,11,0.15); color: #F59E0B; border: 1px solid rgba(245,158,11,0.3); }}
     .btn-amber:hover {{ background: rgba(245,158,11,0.25); }}
@@ -1640,6 +1702,7 @@ ADMIN_HTML = f"""
     <div style="padding:0.8rem 0.4rem 0;">
       <button class="nav-item active" id="nav-users" onclick="showView('users')"><span class="nav-icon">👥</span> Users</button>
       <button class="nav-item" id="nav-logs" onclick="showView('logs')"><span class="nav-icon">🛡️</span> Login Logs</button>
+      <button class="nav-item" id="nav-motion" onclick="showView('motion')"><span class="nav-icon">🎯</span> Motion Events</button>
       <button class="nav-item" id="nav-camera" onclick="showView('camera')"><span class="nav-icon">📷</span> Camera</button>
     </div>
     <div class="sidebar-spacer"></div>
@@ -1674,6 +1737,7 @@ ADMIN_HTML = f"""
         <div class="stat-card"><div class="stat-icon">🔢</div><div class="stat-label">Total</div><div class="stat-value" id="stat-total">—</div></div>
         <div class="stat-card"><div class="stat-icon">✅</div><div class="stat-label">Success</div><div class="stat-value" id="stat-success" style="color:#6EE7B7;">—</div></div>
         <div class="stat-card"><div class="stat-icon">❌</div><div class="stat-label">Failed</div><div class="stat-value" id="stat-failed" style="color:#FCA5A5;">—</div></div>
+        <div class="stat-card"><div class="stat-icon">🚨</div><div class="stat-label">Suspicious</div><div class="stat-value" id="stat-suspicious" style="color:#FCA5A5;">—</div></div>
       </div>
       <div class="panel">
         <div class="panel-header">
@@ -1681,19 +1745,37 @@ ADMIN_HTML = f"""
           <button class="btn btn-amber" onclick="loadLogs()">↻ Refresh</button>
         </div>
         <div class="filter-row">
-          <button class="filter-btn active" id="f-all"     onclick="setFilter('all')">All</button>
-          <button class="filter-btn"        id="f-SUCCESS" onclick="setFilter('SUCCESS')">Success</button>
-          <button class="filter-btn"        id="f-FAILED"  onclick="setFilter('FAILED')">Failed</button>
+          <button class="filter-btn active" id="f-all"        onclick="setFilter('all')">All</button>
+          <button class="filter-btn"        id="f-SUCCESS"    onclick="setFilter('SUCCESS')">Success</button>
+          <button class="filter-btn"        id="f-FAILED"     onclick="setFilter('FAILED')">Failed</button>
+          <button class="filter-btn"        id="f-SUSPICIOUS" onclick="setFilter('SUSPICIOUS')">Suspicious</button>
         </div>
         <div id="logs-container"><div class="no-data">Loading…</div></div>
+      </div>
+    </div>
+
+    <!-- Motion Events -->
+    <div class="view" id="view-motion">
+      <div class="stats-row">
+        <div class="stat-card"><div class="stat-icon">🎯</div><div class="stat-label">Today</div><div class="stat-value" id="stat-motion-today">—</div></div>
+        <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-label">Total</div><div class="stat-value" id="stat-motion-total">—</div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Motion Detection Log</span>
+          <button class="btn btn-amber" onclick="loadMotion()">↻ Refresh</button>
+        </div>
+        <div id="motion-container"><div class="no-data">Loading…</div></div>
       </div>
     </div>
 
     <!-- Camera -->
     <div class="view" id="view-camera">
       <div class="stats-row">
-        <div class="stat-card"><div class="stat-icon">🔴</div><div class="stat-label">CCTV Status</div><div class="stat-value" id="adm-stat-cam" style="font-size:1.1rem;margin-top:8px;">Offline</div></div>
-        <div class="stat-card"><div class="stat-icon">🎥</div><div class="stat-label">CCTV Screen</div><div class="stat-value" id="adm-stat-motion" style="font-size:1.1rem;margin-top:8px;">—</div></div>
+        <div class="stat-card"><div class="stat-icon">🔴</div><div class="stat-label">Camera Status</div><div class="stat-value" id="adm-stat-cam" style="font-size:1.1rem;margin-top:8px;">Offline</div></div>
+        <div class="stat-card"><div class="stat-icon">🎯</div><div class="stat-label">Motion</div><div class="stat-value" id="adm-stat-motion" style="font-size:1.1rem;margin-top:8px;">—</div></div>
+        <div class="stat-card"><div class="stat-icon">📋</div><div class="stat-label">Events Today</div><div class="stat-value" id="adm-stat-today">—</div></div>
+        <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-label">Total Events</div><div class="stat-value" id="adm-stat-total">—</div></div>
       </div>
 
       <div class="panel cam-wrap">
@@ -1706,12 +1788,18 @@ ADMIN_HTML = f"""
         <div class="cam-controls" style="margin-top:1rem;">
           <button class="cam-btn cam-btn-green" onclick="admConnectCctv()">▶ Connect CCTV</button>
           <button class="cam-btn cam-btn-red"   onclick="admDisconnectCctv()">■ Disconnect CCTV</button>
+          <button class="btn btn-amber"          onclick="admLoadMotionEvents()">↻ Refresh Events</button>
         </div>
         <div id="adm-cctv-feedback" style="margin-top:0.8rem; font-size:0.9rem; color:rgba(255,255,255,0.45);"></div>
         <p id="adm-cam-status"></p>
       </div>
 
-
+      <div class="panel" style="margin-top:1.2rem;">
+        <div class="panel-header">
+          <span class="panel-title">Recent Motion Events</span>
+        </div>
+        <div id="adm-motion-log"><div class="no-data">Loading…</div></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1793,6 +1881,7 @@ ADMIN_HTML = f"""
       document.getElementById('stat-total').textContent   = allLogs.length;
       document.getElementById('stat-success').textContent = allLogs.filter(l => l.status==='SUCCESS').length;
       document.getElementById('stat-failed').textContent  = allLogs.filter(l => l.status==='FAILED').length;
+      document.getElementById('stat-suspicious').textContent = allLogs.filter(l => l.status==='SUSPICIOUS').length;
       renderLogs();
     }} catch(e) {{
       document.getElementById('logs-container').innerHTML = '<div class="no-data">⚠️ Failed to load logs.</div>';
